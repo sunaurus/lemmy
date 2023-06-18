@@ -4,7 +4,7 @@ use diesel::{dsl::now, Connection, ExpressionMethods, QueryDsl};
 use diesel::{sql_query, PgConnection, RunQueryDsl};
 use lemmy_db_schema::{
   schema::{comment_aggregates, community_aggregates, post_aggregates},
-  utils::functions::hot_rank,
+  utils::{functions::hot_rank, naive_now},
 };
 use lemmy_utils::error::LemmyError;
 use std::{thread, time::Duration};
@@ -33,7 +33,7 @@ pub fn setup(db_url: String) -> Result<(), LemmyError> {
   scheduler.every(TimeUnits::weeks(1)).run(move || {
     clear_old_activities(&mut conn_3);
   });
-  scheduler.every(TimeUnits::minutes(5)).run(move || {
+  scheduler.every(TimeUnits::minutes(15)).run(move || {
     update_hot_ranks(&mut conn_4, true);
   });
 
@@ -45,66 +45,127 @@ pub fn setup(db_url: String) -> Result<(), LemmyError> {
 }
 
 /// Update the hot_rank columns for the aggregates tables
+/// Runs in batches of 100 until all necessary rows are updated once
 fn update_hot_ranks(conn: &mut PgConnection, last_week_only: bool) {
-  let mut post_update = diesel::update(post_aggregates::table).into_boxed();
-  let mut comment_update = diesel::update(comment_aggregates::table).into_boxed();
-  let mut community_update = diesel::update(community_aggregates::table).into_boxed();
+  let update_start_time = naive_now();
+  let update_batch_size = 5000;
+  let last_week = now - diesel::dsl::IntervalDsl::weeks(1);
 
-  // Only update for the last week of content
   if last_week_only {
     info!("Updating hot ranks for last week...");
-    let last_week = now - diesel::dsl::IntervalDsl::weeks(1);
-
-    post_update = post_update.filter(post_aggregates::published.gt(last_week));
-    comment_update = comment_update.filter(comment_aggregates::published.gt(last_week));
-    community_update = community_update.filter(community_aggregates::published.gt(last_week));
   } else {
     info!("Updating hot ranks for all history...");
   }
 
-  match post_update
-    .set((
-      post_aggregates::hot_rank.eq(hot_rank(post_aggregates::score, post_aggregates::published)),
-      post_aggregates::hot_rank_active.eq(hot_rank(
-        post_aggregates::score,
-        post_aggregates::newest_comment_time_necro,
-      )),
-    ))
-    .execute(conn)
-  {
-    Ok(_) => {}
-    Err(e) => {
-      error!("Failed to update post_aggregates hot_ranks: {}", e)
+  loop {
+    let mut post_select = post_aggregates::table
+      .select(post_aggregates::post_id)
+      .filter(post_aggregates::hot_rank_updated.lt(update_start_time))
+      .order(post_aggregates::post_id.asc())
+      .limit(update_batch_size)
+      .into_boxed();
+
+    if last_week_only {
+      post_select = post_select.filter(post_aggregates::published.gt(last_week));
+    }
+
+    match diesel::update(post_aggregates::table)
+      .set((
+        post_aggregates::hot_rank.eq(hot_rank(post_aggregates::score, post_aggregates::published)),
+        post_aggregates::hot_rank_active.eq(hot_rank(
+          post_aggregates::score,
+          post_aggregates::newest_comment_time_necro,
+        )),
+        post_aggregates::hot_rank_updated.eq(now),
+      ))
+      .filter(post_aggregates::post_id.eq_any(post_select))
+      .execute(conn)
+    {
+      Ok(updated_rows) => {
+        if updated_rows == 0 {
+          break;
+        }
+      }
+      Err(e) => {
+        error!("Failed to update post_aggregates hot_ranks: {}", e);
+        break;
+      }
     }
   }
 
-  match comment_update
-    .set(comment_aggregates::hot_rank.eq(hot_rank(
-      comment_aggregates::score,
-      comment_aggregates::published,
-    )))
-    .execute(conn)
-  {
-    Ok(_) => {}
-    Err(e) => {
-      error!("Failed to update comment_aggregates hot_ranks: {}", e)
+  loop {
+    let mut comment_select = comment_aggregates::table
+      .select(comment_aggregates::comment_id)
+      .filter(comment_aggregates::hot_rank_updated.lt(update_start_time))
+      .order(comment_aggregates::comment_id.asc())
+      .limit(update_batch_size)
+      .into_boxed();
+
+    if last_week_only {
+      comment_select = comment_select.filter(comment_aggregates::published.gt(last_week));
+    }
+
+    match diesel::update(comment_aggregates::table)
+      .set((
+        comment_aggregates::hot_rank.eq(hot_rank(
+          comment_aggregates::score,
+          comment_aggregates::published,
+        )),
+        comment_aggregates::hot_rank_updated.eq(now),
+      ))
+      .filter(comment_aggregates::comment_id.eq_any(comment_select))
+      .execute(conn)
+    {
+      Ok(updated_rows) => {
+        if updated_rows == 0 {
+          break;
+        }
+      }
+      Err(e) => {
+        error!("Failed to update comment_aggregates hot_ranks: {}", e);
+        break;
+      }
+    }
+  }
+  loop {
+    let mut community_select = community_aggregates::table
+      .select(community_aggregates::community_id)
+      .filter(community_aggregates::hot_rank_updated.lt(update_start_time))
+      .order(community_aggregates::community_id.asc())
+      .limit(update_batch_size)
+      .into_boxed();
+
+    if last_week_only {
+      community_select = community_select.filter(community_aggregates::published.gt(last_week));
+    }
+
+    match diesel::update(community_aggregates::table)
+      .set((
+        community_aggregates::hot_rank.eq(hot_rank(
+          community_aggregates::subscribers,
+          community_aggregates::published,
+        )),
+        community_aggregates::hot_rank_updated.eq(now),
+      ))
+      .filter(community_aggregates::community_id.eq_any(community_select))
+      .execute(conn)
+    {
+      Ok(updated_rows) => {
+        if updated_rows == 0 {
+          break;
+        }
+      }
+      Err(e) => {
+        error!("Failed to update community_aggregates hot_ranks: {}", e);
+        break;
+      }
     }
   }
 
-  match community_update
-    .set(community_aggregates::hot_rank.eq(hot_rank(
-      community_aggregates::subscribers,
-      community_aggregates::published,
-    )))
-    .execute(conn)
-  {
-    Ok(_) => {
-      info!("Done.");
-    }
-    Err(e) => {
-      error!("Failed to update community_aggregates hot_ranks: {}", e)
-    }
-  }
+  info!(
+    "Finished hot ranks update which started {}",
+    update_start_time
+  );
 }
 
 /// Clear old activities (this table gets very large)

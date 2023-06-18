@@ -111,6 +111,7 @@ from (
   join comment c2 on c2.path <@ c.path and c2.path != c.path
   and c.path <@ '{top_parent}'
   group by c.id
+  order by c.id
 ) as c
 where ca.comment_id = c.id"
           );
