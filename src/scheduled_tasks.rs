@@ -1,11 +1,17 @@
+use chrono::NaiveDateTime;
 use clokwerk::{Scheduler, TimeUnits};
-use diesel::{dsl::now, Connection, ExpressionMethods, QueryDsl};
+use diesel::{
+  dsl::now,
+  result::Error,
+  sql_types::{Integer, Timestamp},
+  Connection,
+  ExpressionMethods,
+  QueryDsl,
+  QueryableByName,
+};
 // Import week days and WeekDay
 use diesel::{sql_query, PgConnection, RunQueryDsl};
-use lemmy_db_schema::{
-  schema::{comment_aggregates, community_aggregates, post_aggregates},
-  utils::{functions::hot_rank, naive_now},
-};
+use lemmy_db_schema::utils::naive_now;
 use lemmy_utils::error::LemmyError;
 use std::{thread, time::Duration};
 use tracing::{error, info};
@@ -44,128 +50,104 @@ pub fn setup(db_url: String) -> Result<(), LemmyError> {
   }
 }
 
-/// Update the hot_rank columns for the aggregates tables
-/// Runs in batches of 100 until all necessary rows are updated once
-fn update_hot_ranks(conn: &mut PgConnection, last_week_only: bool) {
-  let update_start_time = naive_now();
-  let update_batch_size = 5000;
-  let last_week = now - diesel::dsl::IntervalDsl::weeks(1);
+#[derive(QueryableByName)]
+struct HotRanksUpdateResult {
+  #[diesel(sql_type = Timestamp)]
+  published: NaiveDateTime,
+}
 
-  if last_week_only {
+/// Update the hot_rank columns for the aggregates tables
+/// Runs in batches until all necessary rows are updated once
+fn update_hot_ranks(conn: &mut PgConnection, last_week_only: bool) {
+  let process_start_time = if last_week_only {
     info!("Updating hot ranks for last week...");
+    naive_now() - chrono::Duration::days(7)
   } else {
     info!("Updating hot ranks for all history...");
-  }
+    NaiveDateTime::from_timestamp_opt(0, 0).unwrap()
+  };
 
-  loop {
-    let mut post_select = post_aggregates::table
-      .select(post_aggregates::post_id)
-      .filter(post_aggregates::hot_rank_updated.lt(update_start_time))
-      .order(post_aggregates::post_id.asc())
-      .limit(update_batch_size)
-      .into_boxed();
-
-    if last_week_only {
-      post_select = post_select.filter(post_aggregates::published.gt(last_week));
-    }
-
-    match diesel::update(post_aggregates::table)
-      .set((
-        post_aggregates::hot_rank.eq(hot_rank(post_aggregates::score, post_aggregates::published)),
-        post_aggregates::hot_rank_active.eq(hot_rank(
-          post_aggregates::score,
-          post_aggregates::newest_comment_time_necro,
-        )),
-        post_aggregates::hot_rank_updated.eq(now),
-      ))
-      .filter(post_aggregates::post_id.eq_any(post_select))
-      .execute(conn)
-    {
-      Ok(updated_rows) => {
-        if updated_rows == 0 {
-          break;
-        }
-      }
-      Err(e) => {
-        error!("Failed to update post_aggregates hot_ranks: {}", e);
-        break;
-      }
-    }
-  }
-
-  loop {
-    let mut comment_select = comment_aggregates::table
-      .select(comment_aggregates::comment_id)
-      .filter(comment_aggregates::hot_rank_updated.lt(update_start_time))
-      .order(comment_aggregates::comment_id.asc())
-      .limit(update_batch_size)
-      .into_boxed();
-
-    if last_week_only {
-      comment_select = comment_select.filter(comment_aggregates::published.gt(last_week));
-    }
-
-    match diesel::update(comment_aggregates::table)
-      .set((
-        comment_aggregates::hot_rank.eq(hot_rank(
-          comment_aggregates::score,
-          comment_aggregates::published,
-        )),
-        comment_aggregates::hot_rank_updated.eq(now),
-      ))
-      .filter(comment_aggregates::comment_id.eq_any(comment_select))
-      .execute(conn)
-    {
-      Ok(updated_rows) => {
-        if updated_rows == 0 {
-          break;
-        }
-      }
-      Err(e) => {
-        error!("Failed to update comment_aggregates hot_ranks: {}", e);
-        break;
-      }
-    }
-  }
-  loop {
-    let mut community_select = community_aggregates::table
-      .select(community_aggregates::community_id)
-      .filter(community_aggregates::hot_rank_updated.lt(update_start_time))
-      .order(community_aggregates::community_id.asc())
-      .limit(update_batch_size)
-      .into_boxed();
-
-    if last_week_only {
-      community_select = community_select.filter(community_aggregates::published.gt(last_week));
-    }
-
-    match diesel::update(community_aggregates::table)
-      .set((
-        community_aggregates::hot_rank.eq(hot_rank(
-          community_aggregates::subscribers,
-          community_aggregates::published,
-        )),
-        community_aggregates::hot_rank_updated.eq(now),
-      ))
-      .filter(community_aggregates::community_id.eq_any(community_select))
-      .execute(conn)
-    {
-      Ok(updated_rows) => {
-        if updated_rows == 0 {
-          break;
-        }
-      }
-      Err(e) => {
-        error!("Failed to update community_aggregates hot_ranks: {}", e);
-        break;
-      }
-    }
-  }
-
-  info!(
-    "Finished hot ranks update which started {}",
-    update_start_time
+  process_hot_ranks_in_batches(
+    conn,
+    "post_aggregates",
+    "SET hot_rank = hot_rank(a.score, a.published), 
+         hot_rank_active = hot_rank(a.score, a.newest_comment_time_necro),
+             hot_rank_updated = now()",
+    process_start_time,
   );
+
+  process_hot_ranks_in_batches(
+    conn,
+    "comment_aggregates",
+    "SET hot_rank = hot_rank(a.score, a.published), hot_rank_updated = now()",
+    process_start_time,
+  );
+
+  process_hot_ranks_in_batches(
+    conn,
+    "community_aggregates",
+    "SET hot_rank = hot_rank(a.subscribers, a.published)",
+    process_start_time,
+  );
+
+  info!("Finished hot ranks update!");
+}
+
+/// Runs the hot rank update query in batches until all ids have been processed.
+/// In `set_clause`, "a" will refer to the current aggregates table.
+/// Locked rows are skipped in order to prevent deadlocks (they will likely get updated on the next
+/// run)
+fn process_hot_ranks_in_batches(
+  conn: &mut PgConnection,
+  table_name: &str,
+  set_clause: &str,
+  process_start_time: NaiveDateTime,
+) {
+  let update_batch_size = 1000; // Bigger batches than this tend to cause seq scans
+  let mut previous_batch_last_published = process_start_time;
+  loop {
+    // Raw `sql_query` is used as a performance optimization - Diesel does not support doing this
+    // in a single query (neither as a CTE, nor using a subquery)
+    let result = sql_query(format!(
+      r#"WITH batch AS (SELECT a.id
+               FROM {aggregates_table} a
+               WHERE a.published > $1
+               ORDER BY a.published
+               LIMIT $2
+               FOR UPDATE SKIP LOCKED)
+         UPDATE {aggregates_table} a {set_clause}
+             FROM batch WHERE a.id = batch.id RETURNING a.published;
+    "#,
+      aggregates_table = table_name,
+      set_clause = set_clause
+    ))
+    .bind::<Timestamp, _>(previous_batch_last_published)
+    .bind::<Integer, _>(update_batch_size)
+    .get_results::<HotRanksUpdateResult>(conn);
+
+    match result {
+      Ok(updated_rows) => match updated_rows.last() {
+        Some(row) => {
+          previous_batch_last_published = row.published;
+        }
+        None => {
+          info!("Finished processing {} hot ranks!", table_name);
+          break;
+        }
+      },
+      Err(e) => {
+        match e {
+          Error::NotFound => {
+            info!("Finished processing {} hot ranks!", table_name)
+          }
+          _ => {
+            error!("Failed to update {} hot_ranks: {}", table_name, e);
+          }
+        }
+        break;
+      }
+    }
+  }
 }
 
 /// Clear old activities (this table gets very large)
