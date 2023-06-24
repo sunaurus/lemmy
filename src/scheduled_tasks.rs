@@ -1,5 +1,6 @@
+use chrono::NaiveDateTime;
 use clokwerk::{Scheduler, TimeUnits};
-use diesel::{dsl::now, Connection, ExpressionMethods, QueryDsl};
+use diesel::{dsl::now, result::Error, Connection, ExpressionMethods, QueryDsl, Queryable};
 // Import week days and WeekDay
 use diesel::{sql_query, PgConnection, RunQueryDsl};
 use lemmy_db_schema::{
@@ -44,128 +45,179 @@ pub fn setup(db_url: String) -> Result<(), LemmyError> {
   }
 }
 
-/// Update the hot_rank columns for the aggregates tables
-/// Runs in batches of 100 until all necessary rows are updated once
-fn update_hot_ranks(conn: &mut PgConnection, last_week_only: bool) {
-  let update_start_time = naive_now();
-  let update_batch_size = 5000;
-  let last_week = now - diesel::dsl::IntervalDsl::weeks(1);
+#[derive(Queryable, Debug)]
+struct HotRanksUpdateResult {
+  #[diesel(sql_type = Integer)]
+  id: i32,
+  #[diesel(sql_type = Timestamp)]
+  published: NaiveDateTime,
+}
 
-  if last_week_only {
+/// Update the hot_rank columns for the aggregates tables
+/// Runs in batches until all necessary rows are updated once
+fn update_hot_ranks(conn: &mut PgConnection, last_week_only: bool) {
+  let update_batch_size = 1000;
+  let process_start_time = if last_week_only {
     info!("Updating hot ranks for last week...");
+    naive_now() - chrono::Duration::days(14)
   } else {
     info!("Updating hot ranks for all history...");
-  }
+    NaiveDateTime::from_timestamp_opt(0, 0).unwrap()
+  };
 
-  loop {
-    let mut post_select = post_aggregates::table
-      .select(post_aggregates::post_id)
-      .filter(post_aggregates::hot_rank_updated.lt(update_start_time))
-      .order(post_aggregates::post_id.asc())
-      .limit(update_batch_size)
-      .into_boxed();
-
-    if last_week_only {
-      post_select = post_select.filter(post_aggregates::published.gt(last_week));
-    }
-
-    match diesel::update(post_aggregates::table)
-      .set((
-        post_aggregates::hot_rank.eq(hot_rank(post_aggregates::score, post_aggregates::published)),
-        post_aggregates::hot_rank_active.eq(hot_rank(
-          post_aggregates::score,
-          post_aggregates::newest_comment_time_necro,
-        )),
-        post_aggregates::hot_rank_updated.eq(now),
-      ))
-      .filter(post_aggregates::post_id.eq_any(post_select))
-      .execute(conn)
-    {
-      Ok(updated_rows) => {
-        if updated_rows == 0 {
-          break;
-        }
-      }
-      Err(e) => {
-        error!("Failed to update post_aggregates hot_ranks: {}", e);
-        break;
-      }
-    }
-  }
-
-  loop {
-    let mut comment_select = comment_aggregates::table
-      .select(comment_aggregates::comment_id)
-      .filter(comment_aggregates::hot_rank_updated.lt(update_start_time))
-      .order(comment_aggregates::comment_id.asc())
-      .limit(update_batch_size)
-      .into_boxed();
-
-    if last_week_only {
-      comment_select = comment_select.filter(comment_aggregates::published.gt(last_week));
-    }
-
-    match diesel::update(comment_aggregates::table)
-      .set((
-        comment_aggregates::hot_rank.eq(hot_rank(
-          comment_aggregates::score,
-          comment_aggregates::published,
-        )),
-        comment_aggregates::hot_rank_updated.eq(now),
-      ))
-      .filter(comment_aggregates::comment_id.eq_any(comment_select))
-      .execute(conn)
-    {
-      Ok(updated_rows) => {
-        if updated_rows == 0 {
-          break;
-        }
-      }
-      Err(e) => {
-        error!("Failed to update comment_aggregates hot_ranks: {}", e);
-        break;
-      }
-    }
-  }
-  loop {
-    let mut community_select = community_aggregates::table
-      .select(community_aggregates::community_id)
-      .filter(community_aggregates::hot_rank_updated.lt(update_start_time))
-      .order(community_aggregates::community_id.asc())
-      .limit(update_batch_size)
-      .into_boxed();
-
-    if last_week_only {
-      community_select = community_select.filter(community_aggregates::published.gt(last_week));
-    }
-
-    match diesel::update(community_aggregates::table)
-      .set((
-        community_aggregates::hot_rank.eq(hot_rank(
-          community_aggregates::subscribers,
-          community_aggregates::published,
-        )),
-        community_aggregates::hot_rank_updated.eq(now),
-      ))
-      .filter(community_aggregates::community_id.eq_any(community_select))
-      .execute(conn)
-    {
-      Ok(updated_rows) => {
-        if updated_rows == 0 {
-          break;
-        }
-      }
-      Err(e) => {
-        error!("Failed to update community_aggregates hot_ranks: {}", e);
-        break;
-      }
-    }
-  }
-
-  info!(
-    "Finished hot ranks update which started {}",
-    update_start_time
+  let aggregates_table = post_aggregates::table;
+  let published_col = post_aggregates::published;
+  let id_col = post_aggregates::id;
+  let set = (
+    post_aggregates::hot_rank.eq(hot_rank(post_aggregates::score, published_col)),
+    post_aggregates::hot_rank_active.eq(hot_rank(
+      post_aggregates::score,
+      post_aggregates::newest_comment_time_necro,
+    )),
+    post_aggregates::hot_rank_updated.eq(now),
   );
+
+  let mut batch_start_time = process_start_time;
+  loop {
+    let transaction = conn.transaction::<Option<NaiveDateTime>, Error, _>(|conn| {
+      let batch = aggregates_table
+        .select((id_col, published_col))
+        .filter(published_col.gt(batch_start_time))
+        .order(published_col.asc())
+        .limit(update_batch_size)
+        .for_update()
+        .skip_locked()
+        .load::<HotRanksUpdateResult>(conn)?;
+
+      if batch.len() == 0 {
+        return Ok(None);
+      }
+      let last_published = Some(batch.last().unwrap().published);
+
+      diesel::update(aggregates_table)
+        .set(set)
+        .filter(id_col.eq_any(batch.into_iter().map(|row| row.id)))
+        .execute(conn)?;
+
+      return Ok(last_published);
+    });
+
+    match transaction {
+      Ok(result) => match result {
+        Some(batch_last_published) => {
+          batch_start_time = batch_last_published;
+        }
+        None => {
+          info!("Finished updating post_aggregates hot ranks");
+          break;
+        }
+      },
+      Err(e) => {
+        error!("Failed to update post_aggregates hot ranks: {}", e);
+        break;
+      }
+    };
+  }
+
+  let mut batch_start_time = process_start_time;
+
+  loop {
+    let transaction = conn.transaction::<Option<NaiveDateTime>, Error, _>(|conn| {
+      let batch = comment_aggregates::table
+        .select((comment_aggregates::id, comment_aggregates::published))
+        .filter(comment_aggregates::published.gt(batch_start_time))
+        .order(comment_aggregates::published.asc())
+        .limit(update_batch_size)
+        .for_update()
+        .skip_locked()
+        .load::<HotRanksUpdateResult>(conn)?;
+
+      if batch.len() == 0 {
+        return Ok(None);
+      }
+      let last_published = Some(batch.last().unwrap().published);
+
+      diesel::update(comment_aggregates::table)
+        .set((
+          comment_aggregates::hot_rank.eq(hot_rank(
+            comment_aggregates::score,
+            comment_aggregates::published,
+          )),
+          comment_aggregates::hot_rank_updated.eq(now),
+        ))
+        .filter(comment_aggregates::id.eq_any(batch.into_iter().map(|row| row.id)))
+        .execute(conn)?;
+
+      return Ok(last_published);
+    });
+
+    match transaction {
+      Ok(result) => match result {
+        Some(batch_last_published) => {
+          batch_start_time = batch_last_published;
+        }
+        None => {
+          info!("Finished updating comment_aggregates hot ranks");
+          break;
+        }
+      },
+      Err(e) => {
+        error!("Failed to update comment_aggregates hot ranks: {}", e);
+        break;
+      }
+    };
+  }
+
+  let mut batch_start_time = process_start_time;
+
+  loop {
+    let transaction = conn.transaction::<Option<NaiveDateTime>, Error, _>(|conn| {
+      let batch = community_aggregates::table
+        .select((community_aggregates::id, community_aggregates::published))
+        .filter(community_aggregates::published.gt(batch_start_time))
+        .order(community_aggregates::published.asc())
+        .limit(update_batch_size)
+        .for_update()
+        .skip_locked()
+        .load::<HotRanksUpdateResult>(conn)?;
+
+      if batch.len() == 0 {
+        return Ok(None);
+      }
+      let last_published = Some(batch.last().unwrap().published);
+
+      diesel::update(community_aggregates::table)
+        .set((
+          community_aggregates::hot_rank.eq(hot_rank(
+            community_aggregates::subscribers,
+            community_aggregates::published,
+          )),
+          community_aggregates::hot_rank_updated.eq(now),
+        ))
+        .filter(community_aggregates::id.eq_any(batch.into_iter().map(|row| row.id)))
+        .execute(conn)?;
+
+      return Ok(last_published);
+    });
+
+    match transaction {
+      Ok(result) => match result {
+        Some(batch_last_published) => {
+          batch_start_time = batch_last_published;
+        }
+        None => {
+          info!("Finished updating community_aggregates hot ranks");
+          break;
+        }
+      },
+      Err(e) => {
+        error!("Failed to update community_aggregates hot ranks: {}", e);
+        break;
+      }
+    };
+  }
+
+  info!("Finished hot ranks update",);
 }
 
 /// Clear old activities (this table gets very large)
