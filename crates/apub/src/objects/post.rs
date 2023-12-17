@@ -25,7 +25,7 @@ use html2text::{from_read_with_decorator, render::text_renderer::TrivialDecorato
 use lemmy_api_common::{
   context::LemmyContext,
   request::fetch_site_data,
-  utils::{is_mod_or_admin, local_site_opt_to_sensitive, local_site_opt_to_slur_regex},
+  utils::{is_mod_or_admin, local_site_opt_to_slur_regex},
 };
 use lemmy_db_schema::{
   self,
@@ -208,9 +208,7 @@ impl Object for ApubPost {
       check_url_scheme(&url)?;
 
       let local_site = LocalSite::read(&mut context.pool()).await.ok();
-      let allow_sensitive = local_site_opt_to_sensitive(&local_site);
-      let page_is_sensitive = page.sensitive.unwrap_or(false);
-      let include_image = allow_sensitive || !page_is_sensitive;
+      let include_image = false;
 
       // Only fetch metadata if the post has a url and was not seen previously. We dont want to
       // waste resources by fetching metadata for the same post multiple times.
