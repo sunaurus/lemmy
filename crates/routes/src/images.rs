@@ -10,6 +10,7 @@ use actix_web::{
   HttpRequest,
   HttpResponse,
 };
+use chrono::{DateTime, Duration as ChronoDuration, Local};
 use futures::stream::{Stream, StreamExt};
 use lemmy_api_common::context::LemmyContext;
 use lemmy_db_schema::source::{
@@ -97,6 +98,11 @@ async fn upload(
   local_user_view: LocalUserView,
   context: web::Data<LemmyContext>,
 ) -> Result<HttpResponse, Error> {
+  let now: DateTime<Local> = Local::now();
+  if local_user_view.person.published > now - ChronoDuration::weeks(4) {
+    return Err((error::ErrorForbidden("Your account is too new to upload images")));
+  }
+
   // TODO: check rate limit here
   let pictrs_config = context.settings().pictrs_config()?;
   let image_url = format!("{}image", pictrs_config.url);
