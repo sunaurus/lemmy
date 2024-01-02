@@ -9,6 +9,7 @@ use actix_web::{
   HttpRequest,
   HttpResponse,
 };
+use chrono::{DateTime, Duration as ChronoDuration, Local};
 use futures::stream::{Stream, StreamExt};
 use lemmy_api_common::{context::LemmyContext, request::PictrsResponse};
 use lemmy_db_schema::source::{
@@ -16,7 +17,12 @@ use lemmy_db_schema::source::{
   local_site::LocalSite,
 };
 use lemmy_db_views::structs::LocalUserView;
-use lemmy_utils::{error::LemmyResult, rate_limit::RateLimitCell, REQWEST_TIMEOUT};
+use lemmy_utils::{
+  error::{LemmyError, LemmyResult},
+  rate_limit::RateLimitCell,
+  LemmyErrorType,
+  REQWEST_TIMEOUT,
+};
 use reqwest::Body;
 use reqwest_middleware::{ClientWithMiddleware, RequestBuilder};
 use serde::Deserialize;
@@ -79,6 +85,12 @@ async fn upload(
   client: web::Data<ClientWithMiddleware>,
   context: web::Data<LemmyContext>,
 ) -> LemmyResult<HttpResponse> {
+  let now: DateTime<Local> = Local::now();
+  if local_user_view.person.published > now - ChronoDuration::weeks(4) {
+    Err(LemmyErrorType::PictrsResponseError(
+      "Your account is too new to upload images".to_string(),
+    ))?
+  }
   // TODO: check rate limit here
   let pictrs_config = context.settings().pictrs_config()?;
   let image_url = format!("{}image", pictrs_config.url);
