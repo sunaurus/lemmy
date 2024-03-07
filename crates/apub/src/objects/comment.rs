@@ -32,6 +32,7 @@ use lemmy_utils::{
   utils::{markdown::markdown_to_html, slurs::remove_slurs},
 };
 use std::ops::Deref;
+use tracing::log::info;
 use url::Url;
 
 #[derive(Clone, Debug)]
@@ -130,15 +131,31 @@ impl Object for ApubComment {
     expected_domain: &Url,
     context: &Data<LemmyContext>,
   ) -> Result<(), LemmyError> {
+    info!("comment:verify:{}:1", note.id);
+
     verify_domains_match(note.id.inner(), expected_domain)?;
+    info!("comment:verify:{}:2", note.id);
+
     verify_domains_match(note.attributed_to.inner(), note.id.inner())?;
+    info!("comment:verify:{}:3", note.id);
+
     verify_is_public(&note.to, &note.cc)?;
+    info!("comment:verify:{}:4", note.id);
+
     let community = note.community(context).await?;
 
     check_apub_id_valid_with_strictness(note.id.inner(), community.local, context).await?;
+    info!("comment:verify:{}:5", note.id);
+
     verify_is_remote_object(note.id.inner(), context.settings())?;
+    info!("comment:verify:{}:6", note.id);
+
     verify_person_in_community(&note.attributed_to, &community, context).await?;
+    info!("comment:verify:{}:7", note.id);
+
     let (post, _) = note.get_parents(context).await?;
+    info!("comment:verify:{}:8", note.id);
+
     if post.locked {
       Err(LemmyErrorType::PostIsLocked)?
     } else {
@@ -151,16 +168,29 @@ impl Object for ApubComment {
   /// If the parent community, post and comment(s) are not known locally, these are also fetched.
   #[tracing::instrument(skip_all)]
   async fn from_json(note: Note, context: &Data<LemmyContext>) -> Result<ApubComment, LemmyError> {
+    info!("comment:from_json:{}:1", note.id);
+
     let creator = note.attributed_to.dereference(context).await?;
+    info!("comment:from_json:{}:2", note.id);
+
     let (post, parent_comment) = note.get_parents(context).await?;
+    info!("comment:from_json:{}:3", note.id);
 
     let content = read_from_string_or_source(&note.content, &note.media_type, &note.source);
+    info!("comment:from_json:{}:4", note.id);
 
     let local_site = LocalSite::read(&mut context.pool()).await.ok();
+    info!("comment:from_json:{}:5", note.id);
+
     let slur_regex = &local_site_opt_to_slur_regex(&local_site);
+    info!("comment:from_json:{}:6", note.id);
+
     let content = remove_slurs(&content, slur_regex);
+    info!("comment:from_json:{}:7", note.id);
+
     let language_id =
       LanguageTag::to_language_id_single(note.language, &mut context.pool()).await?;
+    info!("comment:from_json:{}:8", note.id);
 
     let form = CommentInsertForm {
       creator_id: creator.id,
@@ -170,13 +200,19 @@ impl Object for ApubComment {
       published: note.published.map(Into::into),
       updated: note.updated.map(Into::into),
       deleted: Some(false),
-      ap_id: Some(note.id.into()),
+      ap_id: Some(note.id.clone().into()),
       distinguished: note.distinguished,
       local: Some(false),
       language_id,
     };
+    info!("comment:from_json:{}:9", note.id);
+
     let parent_comment_path = parent_comment.map(|t| t.0.path);
+    info!("comment:from_json:{}:10", note.id);
+
     let comment = Comment::create(&mut context.pool(), &form, parent_comment_path.as_ref()).await?;
+    info!("comment:from_json:{}:11", note.id);
+
     Ok(comment.into())
   }
 }

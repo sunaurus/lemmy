@@ -48,6 +48,7 @@ use lemmy_utils::{
 };
 use std::ops::Deref;
 use stringreader::StringReader;
+use tracing::log::info;
 use url::Url;
 
 const MAX_TITLE_LENGTH: usize = 200;
@@ -142,31 +143,50 @@ impl Object for ApubPost {
   ) -> Result<(), LemmyError> {
     // We can't verify the domain in case of mod action, because the mod may be on a different
     // instance from the post author.
+
+    info!("post:verify:{}:1", page.id);
+
     if !page.is_mod_action(context).await? {
       verify_domains_match(page.id.inner(), expected_domain)?;
       verify_is_remote_object(page.id.inner(), context.settings())?;
     };
 
+    info!("post:verify:{}:2", page.id);
+
     let community = page.community(context).await?;
     check_apub_id_valid_with_strictness(page.id.inner(), community.local, context).await?;
+    info!("post:verify:{}:3", page.id);
+
     verify_person_in_community(&page.creator()?, &community, context).await?;
+    info!("post:verify:{}:4", page.id);
 
     let local_site_data = local_site_data_cached(&mut context.pool()).await?;
+    info!("post:verify:{}:5", page.id);
+
     let slur_regex = &local_site_opt_to_slur_regex(&local_site_data.local_site);
+    info!("post:verify:{}:6", page.id);
+
     check_slurs_opt(&page.name, slur_regex)?;
+    info!("post:verify:{}:7", page.id);
 
     verify_domains_match(page.creator()?.inner(), page.id.inner())?;
+    info!("post:verify:{}:8", page.id);
+
     verify_is_public(&page.to, &page.cc)?;
+    info!("post:verify:{}:9", page.id);
+
     Ok(())
   }
 
   #[tracing::instrument(skip_all)]
   async fn from_json(page: Page, context: &Data<Self::DataType>) -> Result<ApubPost, LemmyError> {
+    info!("post:from_json:{}:1", page.id);
     let creator = page.creator()?.dereference(context).await?;
     let community = page.community(context).await?;
     if community.posting_restricted_to_mods {
       is_mod_or_admin(&mut context.pool(), &creator, community.id).await?;
     }
+    info!("post:from_json:{}:2", page.id);
     let mut name = page
       .name
       .clone()
@@ -192,10 +212,15 @@ impl Object for ApubPost {
       name = name.chars().take(MAX_TITLE_LENGTH).collect();
     }
 
+    info!("post:from_json:{}:3", page.id);
+
     // read existing, local post if any (for generating mod log)
     let old_post = page.id.dereference_local(context).await;
 
+    info!("post:from_json:{}:4", page.id);
+
     let form = if !page.is_mod_action(context).await? {
+      info!("post:from_json:{}:5", page.id);
       let first_attachment = page.attachment.into_iter().map(Attachment::url).next();
       let url = if first_attachment.is_some() {
         first_attachment
@@ -207,7 +232,11 @@ impl Object for ApubPost {
       };
       check_url_scheme(&url)?;
 
+      info!("post:from_json:{}:6", page.id);
+
       let local_site = LocalSite::read(&mut context.pool()).await.ok();
+      info!("post:from_json:{}:7", page.id);
+
       let allow_sensitive = local_site_opt_to_sensitive(&local_site);
       let page_is_sensitive = page.sensitive.unwrap_or(false);
       let include_image = allow_sensitive || !page_is_sensitive;
@@ -227,6 +256,9 @@ impl Object for ApubPost {
         }
         _ => (None, None),
       };
+
+      info!("post:from_json:{}:8", page.id);
+
       // If no image was included with metadata, use post image instead when available.
       let thumbnail_url = thumbnail.or_else(|| page.image.map(|i| i.url.into()));
 
@@ -235,10 +267,17 @@ impl Object for ApubPost {
         .unwrap_or_default();
       let slur_regex = &local_site_opt_to_slur_regex(&local_site);
 
+      info!("post:from_json:{}:9", page.id);
+
       let body = read_from_string_or_source_opt(&page.content, &page.media_type, &page.source)
         .map(|s| remove_slurs(&s, slur_regex));
+
+      info!("post:from_json:{}:10", page.id);
+
       let language_id =
         LanguageTag::to_language_id_single(page.language, &mut context.pool()).await?;
+
+      info!("post:from_json:{}:11", page.id);
 
       PostInsertForm {
         name,
@@ -276,6 +315,8 @@ impl Object for ApubPost {
 
     let post = Post::create(&mut context.pool(), &form).await?;
 
+    info!("post:from_json:{}:12", page.id);
+
     // write mod log entry for lock
     if Page::is_locked_changed(&old_post, &page.comments_enabled) {
       let form = ModLockPostForm {
@@ -285,6 +326,8 @@ impl Object for ApubPost {
       };
       ModLockPost::create(&mut context.pool(), &form).await?;
     }
+
+    info!("post:from_json:{}:13", page.id);
 
     Ok(post.into())
   }
