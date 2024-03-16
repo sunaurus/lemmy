@@ -40,6 +40,7 @@ use lemmy_db_schema::{
   traits::{Bannable, Crud, Followable},
 };
 use lemmy_utils::error::LemmyError;
+use tracing::log::info;
 use url::Url;
 
 impl BlockUser {
@@ -125,36 +126,61 @@ impl ActivityHandler for BlockUser {
 
   #[tracing::instrument(skip_all)]
   async fn verify(&self, context: &Data<LemmyContext>) -> Result<(), LemmyError> {
+    log_for_adminbot(self.actor.inner().clone(), 1);
     verify_is_public(&self.to, &self.cc)?;
+    log_for_adminbot(self.actor.inner().clone(), 2);
     match self.target.dereference(context).await? {
       SiteOrCommunity::Site(site) => {
+        log_for_adminbot(self.actor.inner().clone(), 3);
         let domain = self.object.inner().domain().expect("url needs domain");
+        log_for_adminbot(self.actor.inner().clone(), 4);
         if context.settings().hostname == domain {
+          log_for_adminbot(self.actor.inner().clone(), 5);
           return Err(
             anyhow!("Site bans from remote instance can't affect user's home instance").into(),
           );
         }
+        log_for_adminbot(self.actor.inner().clone(), 6);
         // site ban can only target a user who is on the same instance as the actor (admin)
         verify_domains_match(&site.id(), self.actor.inner())?;
+        log_for_adminbot(self.actor.inner().clone(), 7);
         verify_domains_match(&site.id(), self.object.inner())?;
+        log_for_adminbot(self.actor.inner().clone(), 8);
       }
       SiteOrCommunity::Community(community) => {
+        log_for_adminbot(self.actor.inner().clone(), 9);
         verify_person_in_community(&self.actor, &community, context).await?;
+        log_for_adminbot(self.actor.inner().clone(), 10);
         verify_mod_action(&self.actor, &community, context).await?;
+        log_for_adminbot(self.actor.inner().clone(), 11);
       }
     }
+    log_for_adminbot(self.actor.inner().clone(), 12);
+
     Ok(())
   }
 
   #[tracing::instrument(skip_all)]
   async fn receive(self, context: &Data<LemmyContext>) -> Result<(), LemmyError> {
+    log_for_adminbot(self.actor.inner().clone(), 13);
+
     insert_received_activity(&self.id, context).await?;
+    log_for_adminbot(self.actor.inner().clone(), 14);
+
     let expires = self.expires.map(Into::into);
+    log_for_adminbot(self.actor.inner().clone(), 15);
+
     let mod_person = self.actor.dereference(context).await?;
+    log_for_adminbot(self.actor.inner().clone(), 16);
+
     let blocked_person = self.object.dereference(context).await?;
+    log_for_adminbot(self.actor.inner().clone(), 17);
+
     let target = self.target.dereference(context).await?;
+    log_for_adminbot(self.actor.inner().clone(), 18);
     match target {
       SiteOrCommunity::Site(_site) => {
+        log_for_adminbot(self.actor.inner().clone(), 19);
         let blocked_person = Person::update(
           &mut context.pool(),
           blocked_person.id,
@@ -165,9 +191,14 @@ impl ActivityHandler for BlockUser {
           },
         )
         .await?;
+        log_for_adminbot(self.actor.inner().clone(), 20);
+
         if self.remove_data.unwrap_or(false) {
+          log_for_adminbot(self.actor.inner().clone(), 21);
           remove_user_data(blocked_person.id, context).await?;
         }
+
+        log_for_adminbot(self.actor.inner().clone(), 22);
 
         // write mod log
         let form = ModBanForm {
@@ -177,15 +208,21 @@ impl ActivityHandler for BlockUser {
           banned: Some(true),
           expires,
         };
+        log_for_adminbot(self.actor.inner().clone(), 23);
+
         ModBan::create(&mut context.pool(), &form).await?;
+        log_for_adminbot(self.actor.inner().clone(), 24);
       }
       SiteOrCommunity::Community(community) => {
+        log_for_adminbot(self.actor.inner().clone(), 25);
+
         let community_user_ban_form = CommunityPersonBanForm {
           community_id: community.id,
           person_id: blocked_person.id,
           expires: Some(expires),
         };
         CommunityPersonBan::ban(&mut context.pool(), &community_user_ban_form).await?;
+        log_for_adminbot(self.actor.inner().clone(), 26);
 
         // Also unsubscribe them from the community, if they are subscribed
         let community_follower_form = CommunityFollowerForm {
@@ -193,14 +230,19 @@ impl ActivityHandler for BlockUser {
           person_id: blocked_person.id,
           pending: false,
         };
+        log_for_adminbot(self.actor.inner().clone(), 27);
+
         CommunityFollower::unfollow(&mut context.pool(), &community_follower_form)
           .await
           .ok();
+
+        log_for_adminbot(self.actor.inner().clone(), 28);
 
         if self.remove_data.unwrap_or(false) {
           remove_user_data_in_community(community.id, blocked_person.id, &mut context.pool())
             .await?;
         }
+        log_for_adminbot(self.actor.inner().clone(), 29);
 
         // write to mod log
         let form = ModBanFromCommunityForm {
@@ -211,10 +253,21 @@ impl ActivityHandler for BlockUser {
           banned: Some(true),
           expires,
         };
+        log_for_adminbot(self.actor.inner().clone(), 30);
+
         ModBanFromCommunity::create(&mut context.pool(), &form).await?;
       }
     }
+    log_for_adminbot(self.actor.inner().clone(), 31);
 
     Ok(())
+  }
+}
+
+fn log_for_adminbot(actor: Url, breakpoint: i8) {
+  if actor.host_str() == Some("lemm.ee") {
+    if actor.path() == "/u/adminbot" {
+      info!("adminbot@lemm.ee-debug:{}", breakpoint);
+    }
   }
 }
