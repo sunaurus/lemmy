@@ -26,6 +26,7 @@ use mime::Mime;
 use reqwest::{header::CONTENT_TYPE, Client, ClientBuilder};
 use reqwest_middleware::ClientWithMiddleware;
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 use tracing::info;
 use url::Url;
 use urlencoding::encode;
@@ -353,7 +354,7 @@ pub async fn fetch_pictrs_proxied_image_details(
   let res = context
     .client()
     .get(&proxy_url)
-    .timeout(REQWEST_TIMEOUT)
+    .timeout(Duration::from_secs(60))
     .send()
     .await?
     .status();
@@ -366,7 +367,7 @@ pub async fn fetch_pictrs_proxied_image_details(
   let res = context
     .client()
     .get(&details_url)
-    .timeout(REQWEST_TIMEOUT)
+    .timeout(Duration::from_secs(30))
     .send()
     .await?
     .json()

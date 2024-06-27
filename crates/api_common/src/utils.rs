@@ -1000,10 +1000,15 @@ async fn proxy_image_link_internal(
     // This should fail softly, since pictrs might not even be running
     let details_res = fetch_pictrs_proxied_image_details(&link, context).await;
 
-    if let Ok(details) = details_res {
-      let details_form = details.build_image_details_form(&link);
-      RemoteImage::create(&mut context.pool(), &details_form).await?;
-    };
+    match details_res {
+      Ok(details) => {
+        let details_form = details.build_image_details_form(&link);
+        RemoteImage::create(&mut context.pool(), &details_form).await?;
+      }
+      Err(err) => {
+        warn!("Failed to load image details: {}", err)
+      }
+    }
 
     Ok(proxied.into())
   } else {
