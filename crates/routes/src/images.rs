@@ -27,6 +27,7 @@ use reqwest::Body;
 use reqwest_middleware::{ClientWithMiddleware, RequestBuilder};
 use serde::Deserialize;
 use std::time::Duration;
+use tracing::warn;
 use url::Url;
 use urlencoding::decode;
 
@@ -231,7 +232,7 @@ pub async fn image_proxy(
   client: web::Data<ClientWithMiddleware>,
   context: web::Data<LemmyContext>,
 ) -> LemmyResult<HttpResponse> {
-  let url = Url::parse(&decode(&params.url)?)?;
+  let url = Url::parse(&params.url)?;
 
   // Check that url corresponds to a federated image so that this can't be abused as a proxy
   // for arbitrary purposes.
